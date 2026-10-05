@@ -1,6 +1,7 @@
 package com.agnes.partner;
 
 import net.minecraftforge.common.ForgeConfigSpec;
+import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,6 +26,7 @@ public final class PartnerConfig {
     public static final ForgeConfigSpec.ConfigValue<Boolean> yieldToPromaid;
     public static final ForgeConfigSpec.ConfigValue<Boolean> allowWorldEdits;
     public static final ForgeConfigSpec.ConfigValue<Integer> planningSeconds;
+    private static volatile String modelOverride = "";
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
         builder.push("agnes_ai");
@@ -83,6 +85,7 @@ public final class PartnerConfig {
     }
 
     public static String getModel() {
+        if (!modelOverride.isBlank()) return modelOverride;
         if (PORTABLE) return model.get();
         try {
             String localAppData = System.getenv("LOCALAPPDATA");
@@ -91,6 +94,36 @@ public final class PartnerConfig {
             if (!Files.exists(path)) return model.get();
             return JsonParser.parseString(Files.readString(path)).getAsJsonObject().get("model").getAsString();
         } catch (Exception ignored) { return model.get(); }
+    }
+
+    /** Change the active primary model without ever echoing a secret through chat or logs. */
+    public static synchronized void setModel(String value) {
+        String chosen = value == null ? "" : value.trim();
+        if (chosen.isBlank() || chosen.length() > 200
+            || chosen.chars().anyMatch(c -> Character.isWhitespace(c) || Character.isISOControl(c))) {
+            throw new IllegalArgumentException("模型名称不能为空，且不能包含空白字符");
+        }
+        model.set(chosen);
+        SPEC.save();
+        modelOverride = chosen;
+        if (!PORTABLE) {
+            String localAppData = System.getenv("LOCALAPPDATA");
+            if (localAppData != null && !localAppData.isBlank()) {
+                Path path = Paths.get(localAppData, "MinecraftAIPartner", "config.json");
+                try {
+                    JsonObject root;
+                    if (Files.exists(path)) {
+                        var parsed = JsonParser.parseString(Files.readString(path));
+                        root = parsed.isJsonObject() ? parsed.getAsJsonObject() : new JsonObject();
+                    } else root = new JsonObject();
+                    root.addProperty("model", chosen);
+                    Files.createDirectories(path.getParent());
+                    Files.writeString(path, root.toString());
+                } catch (Exception ignored) {
+                    // The Forge config and in-process override remain usable if the legacy file is read-only.
+                }
+            }
+        }
     }
 
     public static String getZhipuApiKey() { return zhipuApiKey.get(); }

@@ -65,6 +65,9 @@ public final class MaidBridge {
         long lastSeen;
         /** Game time the current request started, so a request that never completes cannot wedge her. */
         long pendingSince;
+        /** Monotonic request generation; callbacks from an expired request must never touch the maid. */
+        long requestGeneration;
+        java.util.concurrent.CompletableFuture<?> pendingFuture;
         final Queue<String> queue = new ArrayDeque<>();
         String shareId = "";
         int shareCount;
@@ -254,7 +257,31 @@ public final class MaidBridge {
     }
 
     public static void commands(CommandDispatcher<CommandSourceStack> dispatcher) {
-        dispatcher.register(Commands.literal("aipartner").then(Commands.literal("maid")
+        dispatcher.register(Commands.literal("aipartner")
+            .then(Commands.literal("model")
+                .executes(ctx -> {
+                    ServerPlayer player = ctx.getSource().getPlayerOrException();
+                    String current = PartnerConfig.getModel();
+                    player.sendSystemMessage(Component.literal("[Agnes] 当前主模型：" + current
+                        + "；视觉：" + (PartnerConfig.isVisionEnabled() && PartnerConfig.supportsVision(current) ? "支持" : "不支持/未启用")
+                        + "。切换：/aipartner model <模型名称>"));
+                    return 1;
+                })
+                .then(Commands.argument("name", com.mojang.brigadier.arguments.StringArgumentType.greedyString()).executes(ctx -> {
+                    ServerPlayer player = ctx.getSource().getPlayerOrException();
+                    String chosen = com.mojang.brigadier.arguments.StringArgumentType.getString(ctx, "name").trim();
+                    try {
+                        PartnerConfig.setModel(chosen);
+                        player.sendSystemMessage(Component.literal("[Agnes] 主模型已切换为：" + PartnerConfig.getModel()
+                            + "；视觉：" + (PartnerConfig.isVisionEnabled() && PartnerConfig.supportsVision(PartnerConfig.getModel()) ? "支持" : "不支持/未启用")
+                            + "。API Key 不会显示。"));
+                        return 1;
+                    } catch (RuntimeException invalid) {
+                        player.sendSystemMessage(Component.literal("[Agnes] 模型名称无效：" + invalid.getMessage()));
+                        return 0;
+                    }
+                })))
+            .then(Commands.literal("maid")
             .then(Commands.literal("bind").executes(ctx -> bindNear(ctx.getSource().getPlayerOrException())))
             .then(Commands.literal("unbind").executes(ctx -> {
                 ServerPlayer player = ctx.getSource().getPlayerOrException();
@@ -445,6 +472,8 @@ public final class MaidBridge {
         if (maid == null) { unavailable(player); return; }
         var data = mind(maid);
         tell(maid, player, "Agnes " + (PartnerConfig.getApiKey().isBlank() ? "未配置密钥" : "已配置密钥")
+            + "；主模型：" + PartnerConfig.getModel()
+            + "（视觉" + (PartnerConfig.isVisionEnabled() && PartnerConfig.supportsVision(PartnerConfig.getModel()) ? "支持" : "不支持/未启用") + "）"
             + "；自主活动" + (data.getBoolean("Autonomy") ? "开启" : "关闭")
             + "；工作：" + maid.getTask().getName().getString()
             + "；" + (maid.isHomeModeEnable() ? "驻留/自由工作" : "跟随")
@@ -524,6 +553,41 @@ public final class MaidBridge {
         Session session = SESSIONS.computeIfAbsent(maid.getUUID(), key -> new Session());
         session.lastSeen = System.currentTimeMillis();
         return session;
+    }
+
+    private static long beginPending(Session session, long now) {
+        if (session.pending) invalidatePending(session);
+        session.requestGeneration++;
+        session.pending = true;
+        session.pendingSince = now;
+        session.pendingFuture = null;
+        return session.requestGeneration;
+    }
+
+    private static boolean currentPending(Session session, long generation) {
+        return session.pending && session.requestGeneration == generation;
+    }
+
+    private static void attachPendingFuture(Session session, long generation, java.util.concurrent.CompletableFuture<?> future) {
+        if (currentPending(session, generation)) session.pendingFuture = future;
+        else future.cancel(true);
+    }
+
+    private static void finishPending(Session session, long generation) {
+        if (!currentPending(session, generation)) return;
+        session.pending = false;
+        session.pendingSince = 0;
+        session.pendingFuture = null;
+    }
+
+    /** Invalidate and interrupt the current network/capture chain. Late callbacks fail currentPending. */
+    private static void invalidatePending(Session session) {
+        session.requestGeneration++;
+        java.util.concurrent.CompletableFuture<?> future = session.pendingFuture;
+        session.pendingFuture = null;
+        session.pending = false;
+        session.pendingSince = 0;
+        if (future != null) future.cancel(true);
     }
 
     @SubscribeEvent public void stop(ServerStoppedEvent event) { SESSIONS.clear(); OWNER_POSITIONS.clear(); MaidFieldwork.clear(); MaidPlan.clearAll(); MaidVision.clear(); MaidVoice.clear(); MaidHunt.clear(); MaidDig.clear(); MaidLandmarks.clear(); MaidSurvival.clearFarmProbes(); }
@@ -615,11 +679,13 @@ public final class MaidBridge {
         // so, so a hung request can never look like "she simply refuses to act".
         Session watchdog = session(maid);
         if (watchdog.pending && maid.level().getGameTime() - watchdog.pendingSince > REQUEST_WATCHDOG) {
-            watchdog.pending = false;
+            long elapsed = Math.max(0, (maid.level().getGameTime() - watchdog.pendingSince) / 20);
+            invalidatePending(watchdog);
             watchdog.queue.clear();
-            outcome(maid, "上一次请求超过三分钟没有返回，已取消它并继续安排");
+            outcome(maid, "上一次请求超过 " + elapsed + " 秒没有返回，已取消它并继续安排");
             mind(maid).putLong("NextThink", maid.level().getGameTime() + 100);
-            tell(maid, player, "刚才那次请求超过 90 秒没有返回，我已经取消它，马上重新安排。");
+            tell(maid, player, "刚才那次请求超过 " + elapsed + " 秒没有返回，我已经取消它，马上重新安排。");
+            trace(maid, "request watchdog cancelled generation after " + elapsed + "s");
         }
         MaidSurvival.tick(maid, player);
         updatePersonality(maid);
@@ -792,24 +858,30 @@ public final class MaidBridge {
 
     private static void request(EntityMaid maid, ServerPlayer player, Session session, String input, boolean autonomous) {
         String beforeCapture = stamp(maid);
-        session.pending = true; session.pendingSince = maid.level().getGameTime();
-        MaidVision.request(player, maid).whenComplete((unused, error) -> player.server.execute(() -> {
-            if (SESSIONS.get(maid.getUUID()) != session || !valid(maid, player)) { session.pending = false; return; }
+        long generation = beginPending(session, maid.level().getGameTime());
+        java.util.concurrent.CompletableFuture<Void> capture = MaidVision.request(player, maid);
+        attachPendingFuture(session, generation, capture);
+        capture.whenComplete((unused, error) -> player.server.execute(() -> {
+            if (!currentPending(session, generation) || SESSIONS.get(maid.getUUID()) != session || !valid(maid, player)) {
+                finishPending(session, generation);
+                return;
+            }
             if (autonomous && (!mind(maid).getBoolean("Autonomy") || !stamp(maid).equals(beforeCapture))) {
-                session.pending = false;
+                finishPending(session, generation);
                 String next = session.queue.poll();
                 if (next != null) request(maid, player, session, next, false);
                 return;
             }
-            requestAfterCapture(maid, player, session, input, autonomous, 0);
+            requestAfterCapture(maid, player, session, input, autonomous, 0, generation);
         }));
     }
 
     /** A decision built on a picture this old is a guess, so she tries once more for a fresh one. */
     private static final long FRESH_FRAME_MS = 5000;
 
-    private static void requestAfterCapture(EntityMaid maid, ServerPlayer player, Session session, String input, boolean autonomous, int attempts) {
-        session.pending = false;
+    private static void requestAfterCapture(EntityMaid maid, ServerPlayer player, Session session, String input,
+                                            boolean autonomous, int attempts, long generation) {
+        if (!currentPending(session, generation)) return;
         if (autonomous && attempts < 2) {
             MaidVision.Frame frame = MaidVision.read(player, maid);
             // A missed capture is not a failure: planning on game state is fully supported, so this
@@ -819,17 +891,22 @@ public final class MaidBridge {
                     mind(maid).putString("LastVision", "本次没有拿到女仆画面，改用游戏状态");
                 } else {
                     MaidBubble.think(maid, "先把眼前的画面看清楚……");
-                    MaidVision.request(player, maid).whenComplete((unused, error) -> player.server.execute(() -> {
-                        if (SESSIONS.get(maid.getUUID()) != session || !valid(maid, player)) { session.pending = false; return; }
-                        requestAfterCapture(maid, player, session, input, autonomous, attempts + 1);
+                    java.util.concurrent.CompletableFuture<Void> capture = MaidVision.request(player, maid);
+                    attachPendingFuture(session, generation, capture);
+                    capture.whenComplete((unused, error) -> player.server.execute(() -> {
+                        if (!currentPending(session, generation) || SESSIONS.get(maid.getUUID()) != session || !valid(maid, player)) {
+                            finishPending(session, generation);
+                            return;
+                        }
+                        requestAfterCapture(maid, player, session, input, autonomous, attempts + 1, generation);
                     }));
                     return;
                 }
             }
         }
-        try { requestInternal(maid, player, session, input, autonomous); }
+        try { requestInternal(maid, player, session, input, autonomous, generation); }
         catch (RuntimeException preparationError) {
-            session.pending = false;
+            finishPending(session, generation);
             outcome(maid, "读取任务或环境时出错，未发送请求");
             mind(maid).remove("LastAutonomousRequest");
             mind(maid).putLong("NextThink", maid.level().getGameTime() + Math.min(PartnerConfig.planningInterval(), 200));
@@ -837,14 +914,20 @@ public final class MaidBridge {
         }
     }
 
-    private static void requestInternal(EntityMaid maid, ServerPlayer player, Session session, String input, boolean autonomous) {
-        if (!valid(maid, player)) return;
+    private static void requestInternal(EntityMaid maid, ServerPlayer player, Session session, String input,
+                                        boolean autonomous, long generation) {
+        if (!currentPending(session, generation) || !valid(maid, player)) {
+            finishPending(session, generation);
+            return;
+        }
         if (autonomous && mind(maid).contains("LastAutonomousRequest")) {
             long now = maid.level().getGameTime();
             long retryAt = mind(maid).getLong("RetryAt");
             long regularDue = mind(maid).getLong("LastAutonomousRequest") + PartnerConfig.planningInterval();
             if (now < regularDue && (retryAt <= 0 || now < retryAt)) {
-                mind(maid).putLong("NextThink", regularDue); return;
+                mind(maid).putLong("NextThink", regularDue);
+                finishPending(session, generation);
+                return;
             }
         }
         if (autonomous) mind(maid).putLong("LastAutonomousRequest", maid.level().getGameTime());
@@ -853,7 +936,6 @@ public final class MaidBridge {
             // line about her own state goes out first; the conversation follows in the next bubble.
             try { MaidVoice.tick(maid, player); } catch (RuntimeException brokenVoice) { MaidVoice.clear(); }
         }
-        session.pending = true; session.pendingSince = maid.level().getGameTime();
         if (autonomous) MaidSurvival.observeProgress(maid);
         String stateStamp = stamp(maid);
         JsonObject state = new JsonObject();
@@ -990,7 +1072,8 @@ public final class MaidBridge {
             user.add("content", content);
         }
         String key = PartnerConfig.getApiKey();
-        send(body, key, "https://apihub.agnes-ai.com/v1/chat/completions", PartnerConfig.getModel()).thenCompose(response -> {
+        java.util.concurrent.CompletableFuture<HttpResponse<String>> network = send(body, key,
+            "https://apihub.agnes-ai.com/v1/chat/completions", PartnerConfig.getModel()).thenCompose(response -> {
             if (primarySupportsVision && !screenshot.isBlank() && (response.statusCode() < 200 || response.statusCode() >= 300)) {
                 imageAccepted.set(false);
                 textBody.getAsJsonArray("messages").get(messages.size()-1).getAsJsonObject().addProperty("content", prompt + "\nImage upload was rejected; no screenshot is attached to this request. Use game state only.");
@@ -1017,9 +1100,11 @@ public final class MaidBridge {
             }
             if (error != null) return java.util.concurrent.CompletableFuture.<HttpResponse<String>>failedFuture(error);
             return java.util.concurrent.CompletableFuture.completedFuture(response);
-        }).thenCompose(future -> future).whenComplete((response, error) -> player.server.execute(() -> {
-            if (SESSIONS.get(maid.getUUID()) != session || !valid(maid, player)) return;
-            session.pending = false;
+        }).thenCompose(future -> future);
+        attachPendingFuture(session, generation, network);
+        network.whenComplete((response, error) -> player.server.execute(() -> {
+            if (!currentPending(session, generation) || SESSIONS.get(maid.getUUID()) != session || !valid(maid, player)) return;
+            finishPending(session, generation);
             try {
             if (error != null) throw new IllegalStateException("Agnes、智谱和通用备用请求都失败：连接超时或网络异常");
                 if (response.statusCode() < 200 || response.statusCode() >= 300) throw new IllegalStateException("模型 HTTP " + response.statusCode());
