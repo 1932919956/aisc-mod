@@ -1,0 +1,16 @@
+.gradle/
+.idea/
+.vscode/
+build/
+out/
+run/
+runs/
+libs/*.jar
+config/
+logs/
+crash-reports/
+screenshots/
+*.log
+*.tmp
+*.disabled
+src/portable/resources/agnespartner-portable.flag

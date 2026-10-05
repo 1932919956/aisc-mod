@@ -1,0 +1,14 @@
+# Optional blank template. Launching the mod generates this file automatically.
+# Save your own API key in the GAME DIRECTORY/config/agnespartner-portable.toml.
+# Do not overwrite an already configured file with this blank template.
+[agnes_ai]
+apiKey = ""
+model = "agnes-2.5-flash"
+visionEnabled = true
+autonomousMode = true
+planningIntervalSeconds = 30
+yieldToPromaid = false
+customApiUrl = "https://api.openai.com/v1/chat/completions"
+customApiKey = ""
+customModel = ""
+customFallback = true

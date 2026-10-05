@@ -1,0 +1,70 @@
+plugins {
+    id 'eclipse'; id 'idea'; id 'maven-publish'; id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+version = mod_version; group = mod_group_id
+base { archivesName = mod_id }
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+minecraft {
+    mappings channel: mapping_channel, version: mapping_version
+    copyIdeResources = true
+    runs {
+        configureEach {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods { "${mod_id}" { source sourceSets.main } }
+        }
+        client { property 'forge.enabledGameTestNamespaces', mod_id }
+        server { property 'forge.enabledGameTestNamespaces', mod_id; args '--nogui' }
+        gameTestServer { workingDirectory project.file('runs/forge-knowledge-tests'); property 'forge.enabledGameTestNamespaces', mod_id }
+    }
+}
+tasks.register('physicalGoSmoke', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.agnes.partner.PhysicalGoSmoke'
+}
+if (project.hasProperty('portable')) {
+    sourceSets.main.resources.srcDir 'src/portable/resources'
+    minecraft.runs.gameTestServer.property 'agnespartner.expectPortable','true'
+}
+// Runtime verification harness. Kept behind its own flag so a release build can never include it.
+// The old gametest flag was relied on for this and silently did not add the source directory, which
+// meant the harness compiled to nothing while every run looked like a pass.
+if (project.hasProperty('verifyHarness')) {
+    sourceSets.main.java.srcDir 'src/gametest/java'
+}
+if (project.hasProperty('knowledgeTests') || project.hasProperty('maidTests')) {
+    sourceSets.main.java.srcDir 'src/gametest/java'
+    minecraft.runs.gameTestServer.property 'forge.enabledGameTestNamespaces','agnespartner,minecraft'
+}
+if (project.hasProperty('maidTests')) {
+    sourceSets.main.java.srcDir 'src/maidtest/java'
+    minecraft.runs.gameTestServer.workingDirectory project.file('runs/forge-maid-tests')
+    minecraft.runs.gameTestServer.property 'mixin.env.remapRefMap','true'
+    minecraft.runs.gameTestServer.property 'mixin.env.refMapRemappingFile', "${buildDir}/createSrgToMcp/output.srg"
+}
+if (project.hasProperty('visionTests')) {
+    sourceSets.main.java.srcDir 'src/visiontest/java'
+    minecraft.runs.client.workingDirectory project.file('runs/forge-vision-tests')
+    minecraft.runs.client.property 'mixin.env.remapRefMap','true'
+    minecraft.runs.client.property 'mixin.env.refMapRemappingFile', "${buildDir}/createSrgToMcp/output.srg"
+}
+repositories { flatDir { dirs 'libs' } }
+dependencies {
+    compileOnly fg.deobf('local:touhoulittlemaid:1.5.3')
+    if (project.hasProperty('maidTests') || project.hasProperty('visionTests')) runtimeOnly fg.deobf('local:touhoulittlemaid:1.5.3')
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    if (project.hasProperty('visionRenderMods')) {
+        runtimeOnly fg.deobf('local:embeddium:0.3.31')
+        runtimeOnly fg.deobf('local:oculus:1.8.1')
+    }
+}
+sourceSets.main.resources { srcDir 'src/generated/resources' }
+tasks.named('processResources', ProcessResources).configure {
+    var props=[minecraft_version:minecraft_version,minecraft_version_range:minecraft_version_range,forge_version:forge_version,forge_version_range:forge_version_range,loader_version_range:loader_version_range,mod_id:mod_id,mod_name:mod_name,mod_license:mod_license,mod_version:mod_version,mod_authors:mod_authors,mod_description:mod_description]
+    inputs.properties props
+    filesMatching(['META-INF/mods.toml','pack.mcmeta']) { expand props + [project:project] }
+}
+tasks.named('jar', Jar).configure { manifest { attributes(['Specification-Title':mod_id,'Specification-Vendor':mod_authors,'Implementation-Version':project.jar.archiveVersion]) } }
