@@ -1,0 +1,79 @@
+Agnes 女仆伙伴独立安装包
+版本：portable 1.0.46-portable + Promaid 1.3.0 Forge（旧 Agnes 版本已改名为 .disabled，不要与当前版一起激活）
+
+这一版做了什么
+  三、第三顺位备用改为通用 OpenAI 兼容接口
+      删除固定的硅基流动配置，改为可自定义的 API 地址、API Key 和模型名称。
+      只要服务接受标准 /v1/chat/completions 请求，就可以作为 Agnes、智谱之后的备用；
+      地址必须是 HTTP/HTTPS，Key 可留空以支持本地服务，模型名留空则不调用。
+  四、Promaid 共存策略
+      已安装 Forge 1.20.1 的 Promaid 1.3.0。两者现在采用协作模式：Promaid 保留自保、装备、灯光、手册等增强功能，
+      Agnes 保留采集、建造和阶梯竖井执行；自主模式暂不主动追逐移动动物，敌对生物由车万女仆原生 Attack 任务即时反击。
+      开关开启状态已实测通过，Promaid 不会再取消 Agnes 的采集或挖掘。
+  一、架构转向：执行层交给车万女仆自己的 Agent
+      车万女仆 1.5.2+ 本身已经实现了完整的"模型 → 工具调用 → 游戏执行 → 结果回模型"循环，
+      对话历史、气泡显示、工具 schema 都是它自带的。我们之前自己又写了一套，绝大多数 bug
+      （动作白名单不同步、状态机卡死、"说要做却没做"）都出在那套自研执行器上。
+      定下三层：
+        第 1 层 Agnes 战略层    —— 决定"现在该干什么"
+        第 2 层 女仆原生 Agent  —— 工具调用循环（TLM 自带），我们只注册工具 + 递一句意图
+        第 3 层 女仆原生 Task   —— 真正走路、挖方块、放方块
+      新增两个文件：
+        AgnesMaidExtension.java  @LittleMaidExtension + ILittleMaid.registerAITool，注册工具给女仆 Agent
+        MaidSituationTool.java   第一个工具 maid_situation（只读）：work_mode / running_action / health /
+                                 food / holding / position / mob_griefing_rule /
+                                 companion_world_edits_allowed / last_action_result / remembered_places
+
+  二、修掉一个真实的挖掘死锁（MaidDig）
+      阶梯竖井每次都会在"第 0 格"停住：代码判断女仆是否站上了新台阶时，比较的是她面前那个方块
+      的位置。可那个方块刚被她自己挖空，而且它脚下的地面也一起被挖掉了——那个位置根本没有东西
+      可以站，等式永远不成立；十秒后她就报"挖到 0 格就上不去了"。她真正落下去站的位置是它下面
+      那一格。现在比较和寻路目标都改成那一格，竖井终于会一层层往下走。
+      这个问题只有在真机（真实 tick）测试里才会暴露：以前测试用死循环调用"每秒一次"的动作机，
+      服务器时钟根本没走，进度永远停在 1/2 秒。
+
+真机自动测试（真实 Forge 47.4.18 服务端 + 车万女仆 1.5.3 + 官方服务端 jar）
+  ===== AGNES VERIFY BEGIN =====
+  VERIFY PASS bubbles         原生气泡（说话 + 思考）真的挂上去且不堆叠
+  VERIFY PASS personality     人格、称呼、好感度、防重复、防冒充行动汇报
+  VERIFY PASS landmarks       地标记录/列出/解析 + 对真实方块核对
+  VERIFY PASS sight           视野清单发现真实放置的工作台和熔炉
+  VERIFY PASS hunting-rules   拒绝命名动物和女仆；接受野生牛，并且真的挥击造成伤害
+  VERIFY PASS blueprints      三种蓝图数据完整（无重复格/无越界/门与火把数正确）
+  VERIFY PASS agent-tools     女仆原生 Agent 里确实注册了 maid_situation，报告能渲染、schema 能构建
+  VERIFY PASS crafting        真的扣材料、真的产出合成台并进背包
+  VERIFY PASS executor-gather 她真的走了 5 格过去，把石头挖掉（3 秒）
+  VERIFY PASS executor-dig    她真的挖出了向下的阶梯竖井（3 秒，地面确实先是实心石头）
+  VERIFY PASS farm-availability  农田可用性检测按女仆当前位置核对可达耕地和种子
+  ===== AGNES VERIFY END passed=11 failed=0 =====
+
+  测试台的两次翻车（都被抓住并修掉，所以上面的 PASS 才可信）
+    1. 最早在 ServerStartedEvent 里死循环调用"每秒一次"的动作机：那时服务器还没开始 tick，
+       游戏时钟是冻结的（状态报告里 day_time=0 就是铁证），采集的"同一秒只能算一次"闸门把所有
+       后续调用全挡掉，进度永远停在"1/2 秒"。现在整套走真实 tick，和真实心跳完全一致。
+    2. 挖竖井的测试场地先是选在地表：一挖就通到水，模型内置的安全规则立刻停下（这是**正确**的
+       行为）。换成地表以下 20 格之后更糟——这个世界地表在 y=-60、世界最低是 y=-64，石头根本没
+       放下去，一百格"空气"被算成了成功。这一版改成在空中造一个封闭石室，并且开测前先检查她
+       脚下确实是实心（低于 50/100 实心就直接判失败，绝不再拿虚空当阶梯）。
+
+  其它已拿到的真实证据（服务器日志原文）：
+      hunt swing 1 on Cow health=9 damage=1.0
+      实际采集完成 stone:-127:69:133；圆石：入包
+
+尚未完成
+  - 把女仆原生 Agent 的站点（LLMOpenAISite.setUrl/setSecretKey）指向 Agnes 端点，做到一个
+    API Key 两层共用（接口已确认存在，还没接线；目前只有第 1 层那条 HTTP 通道在用这个 key）
+  - 长距离寻路、深度导航、"一路挖到钻石"（现在的竖井只到计划深度，不做分支挖矿、不下矿洞）
+  - 客户端画面（气泡渲染、相机抓帧）无法无头验证，需要你进游戏看
+
+节奏：planningIntervalSeconds 默认 30 秒（可改 10~300；旧配置若仍为 120，需要在 config 中改为 30）
+配置：allowWorldEditsWhenMobGriefingOff = true（你的整合包关了 mobGriefing）
+游戏：安装用-mods 里当前是 agnespartner-1.0.46-portable.jar 和 promaid-1.3.0-forge-1.20.1.jar，需要重启游戏生效；游戏 mods 目录中的旧版本已改名为 .disabled，避免重复加载
+
+SHA256：
+安装用-mods\agnespartner-1.0.46-portable.jar | 355980 bytes | 61C99747EA394180A04552D98B7626263271313AEA742C69BE5767C80E65579C
+安装用-mods\promaid-1.3.0-forge-1.20.1.jar | 12678111 bytes | 018DE4522FFE5BA7B1B27E91C59E34F47B67396CC4CC3E3B3DEBDF4F6673CCD0
+
+详细架构与功能总账：详细说明\架构与功能总览.md
+验证脚本：C:\Users\wangkun\Documents\deepseek\run-verify.ps1
+

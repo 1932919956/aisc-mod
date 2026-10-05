@@ -2,6 +2,7 @@ package com.agnes.partner;
 
 import com.github.tartaricacid.touhoulittlemaid.api.task.FunctionCallSwitchResult;
 import com.github.tartaricacid.touhoulittlemaid.api.task.IFarmTask;
+import com.github.tartaricacid.touhoulittlemaid.api.task.IAttackTask;
 import com.github.tartaricacid.touhoulittlemaid.api.task.IMaidTask;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
 import com.github.tartaricacid.touhoulittlemaid.entity.task.TaskManager;
@@ -21,6 +22,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.item.ItemStack;
@@ -99,6 +101,27 @@ public final class MaidBridge {
         return MaidRescue.busy(maid) || (MaidRescue.externalInstalled()
             && (tag.getBoolean("isKnockDown") || tag.getBoolean("isRescuing") || tag.getBoolean("isPlayerRescuing")
             || tag.getInt("assignedRescueMaidId") > 0 || tag.getInt("rescueMaidTargetId") > 0));
+    }
+
+    /** Native defense is deliberately independent of Agnes: combat must react on the same tick. */
+    private static void nativeDefense(EntityMaid maid) {
+        if (maid.isSleeping() || maid.isOrderedToSit() || maid.isPassenger() || maidReformBusy(maid)
+            || mind(maid).getBoolean("Recovering")) return;
+        Monster threat = maid.level().getEntitiesOfClass(Monster.class, maid.getBoundingBox().inflate(12), mob ->
+            mob.isAlive() && mob.canAttack(maid) && maid.hasLineOfSight(mob))
+            .stream().min(Comparator.comparingDouble(maid::distanceToSqr)).orElse(null);
+        if (threat == null) return;
+        threat.setTarget(maid);
+        if (maid.getTarget() != threat) maid.setTarget(threat);
+        if (!(maid.getTask() instanceof IAttackTask)) {
+            TaskManager.getTaskIndex().stream().filter(t -> t instanceof IAttackTask && t.isEnable(maid) && !t.isHidden(maid))
+                .findFirst().ifPresent(maid::setTask);
+        }
+        MaidPlan.clear(maid, "遭到敌对生物攻击，交给女仆原生战斗");
+        MaidFieldwork.cancel(maid, "遭到敌对生物攻击，交给女仆原生战斗");
+        MaidWorkshop.cancel(maid, "遭到敌对生物攻击，交给女仆原生战斗");
+        MaidHunt.cancel(maid, "遭到敌对生物攻击，停止主动狩猎");
+        mind(maid).putString("Outcome", "敌对生物靠近，女仆原生战斗中");
     }
 
     static boolean bringToOwner(ServerPlayer player, EntityMaid maid, String reason) {
@@ -517,6 +540,7 @@ public final class MaidBridge {
         // TLM's snowball task may target the owner and stop navigation after its throw animation.
         // Agnes work owns movement, so discard only that friendly target while a fieldwork step is active.
         PromaidCompat.protectAgnesWork(maid);
+        nativeDefense(maid);
         if (maidReformBusy(maid)) {
             MaidPlan.clear(maid,"倒地或救援，暂停生存计划"); MaidWorkshop.cancel(maid,"倒地或救援");
             MaidFieldwork.cancel(maid, "女仆正在倒地或救援，暂停 Agnes 行动");
@@ -562,7 +586,7 @@ public final class MaidBridge {
             watchdog.queue.clear();
             outcome(maid, "上一次请求超过三分钟没有返回，已取消它并继续安排");
             mind(maid).putLong("NextThink", maid.level().getGameTime() + 100);
-            tell(maid, player, "刚才那次请求卡住了，我已经取消它，马上重新安排。");
+            tell(maid, player, "刚才那次请求超过 90 秒没有返回，我已经取消它，马上重新安排。");
         }
         MaidSurvival.tick(maid, player);
         updatePersonality(maid);
@@ -897,7 +921,7 @@ public final class MaidBridge {
             fieldwork.area_survey incrementally scans a horizontal radius of 100 blocks in LOADED chunks, the nearby height band and surface. This is game-data knowledge, not visual line-of-sight or a guarantee of a path. Read scan_percent and skipped_unloaded_columns. An attached screenshot is YOUR MAID'S first-person camera at camera_observation.eye_position/yaw/pitch, NOT the owner's screen. It contains only terrain loaded by the owner's client. It is a past observation: use its age and capture pose; your current direction may have changed. Darkness, occlusion and missing terrain are not proof of an empty safe path. The authoritative game state and executable observed target IDs take priority over image guesses. If no image is attached do not pretend to see one. Do not say your observation range is four blocks; four blocks is the local workstation/container interaction distance, not your observation radius.
             Return ONLY a JSON object with these fields:
             {"say":"Chinese conversation reply or empty","proactive_chat":"short optional social line or empty","remember_quote":"exact short owner preference quote or empty","action":"plan|keep|follow|stay|explore|task|share|inspect_storage|craft|equip|gather|approach|place|smelt|withdraw|deposit|build_house|look|scan_area|visit_landmark|hunt|dig_shaft","steps":[],"site_id":"observed house site ID","amount":1,"target_id":"EXACT observed target ID, huntable_animals target_id, or landmark:N from memory.remembered_places","yaw":0,"pitch":0,"task_id":"EXACT available task id","recipe_id":"EXACT observed recipe id","item_id":"EXACT item id","goal":"concrete ongoing survival goal","count":1}
-            hunt goes after one real animal to get food: use target_id from huntable_animals, or target_kind=animal to let the executor pick the nearest. Check hunt_rule first: while she is empty handed she can only kill small animals, so craft or equip a sword or axe before planning a hunt on anything big. She walks to it, attacks with whatever she is holding, and the loot really goes into her backpack. Only wild, unnamed, untamed animals are huntable; she never touches the owner's pets and never hunts a player. This is different from her native combat, which only answers something that attacks her first. When food is low and animals are around, hunting beats berries and fishing.
+            Do not choose hunt during autonomous planning. Moving animals are unreliable targets and active hunting is disabled in this mode; use gathered food, berries, fishing or an actually available native farm task instead. Hostile defense is handled immediately by the maid's native Attack task and never waits for Agnes.
             dig_shaft makes a one-wide staircase straight down to get stone and iron, with count as the target depth (4-24, default 12). The stairs she digs ARE the way back up, so she never traps herself. She stops and returns to the surface the moment a block would open into water or lava, if she is low on health, if she is attacked, or if she cannot reach the next step. The shaft is slow: one step at a time, placing a torch every six blocks. She records the shaft as her mine when it is done. She cannot mine sideways into a vein, cannot dig into bedrock, and cannot clear gravel or sand that would fall on her.
             memory.remembered_places are places SHE recorded herself: her water, the ore she dug, the shelter she built, her table and furnace, her farm, her camp. Each has a target_id like landmark:3, a name, a distance and how often it was used. She wrote these from actions that really happened, so they are the best available guess about where things are, but they are still only a memory. Use action=visit_landmark with that target_id (or approach with it) to go back to one: no fresh observation is needed, she walks from memory and checks on arrival whether it is still what she remembers. A place marked as not found last time may be gone; if you go anyway, expect her to forget it after another failure. Prefer a remembered water or camp over wandering when you need food or a safe spot, and prefer visiting over scanning when something you need is already in the list.
             sight is what her own eyes can see right now: forward_ray is the first solid thing in her line of sight, visible_columns lists the nearest thing in each direction inside her view cone with its block id, distance, whether it is reachable and whether it has a gatherable_as kind plus the exact target_id to use, and walkable_ground_ahead tells you whether the way in front is open. Use it together with the picture: the image shows the situation, sight makes it exact. Report what you see honestly; never claim to see something that is not in sight, the survey or the game state.
@@ -905,10 +929,10 @@ public final class MaidBridge {
             For idle survival prefer action=plan with 1-8 steps (max 16 operations total). Each step is {"action":"gather|approach|craft|equip|place|smelt|withdraw|deposit|build_house","target_kind":"wood|berries|stone|coal|iron","target_id":"observed ID when needed","recipe_id":"observed recipe ID","item_id":"item ID","count":1}. A gather step may use target_kind instead of target_id; executor selects a fresh observed reachable candidate of ONLY your chosen kind each time. count repeats 1-8 times, allowing collecting several logs or cobblestone and crafting multiple batches without waiting for the next planning interval between each. An exact target_id will NOT magically replenish: do not repeat a removed block. All prerequisites are checked before each step; first failure stops the rest and feeds you the reason next round. No new activities are invented locally. Native work, conversation, share, rest and follow must be single actions, not inside steps.
             Physical intentions MUST have a matching action and its required ID, not merely say or goal. gather supports berries, natural tree logs, exposed stone/deepslate/coal/iron; mining requires a correct held pickaxe (iron ore needs stone or better). For approach select table, furnace, storage or scout. For explore select a scout destination; this is actual walking. Never invent coordinates or IDs. Each gather operation walks to and collects ONE resource and spends tool durability. It takes time and may fail. Never announce completion before the executor confirms it.
             During autonomy, if idle, healthy and not resting, select a useful feasible action when one exists. When food is low prefer a listed berry target; for missing wood use a listed wood target; then craft real supplies using actual ingredients. Avoid excessive stocks and repeating a blocked action. If nothing is feasible explain the actual missing condition, or approach a listed scout destination. Keep productive native tasks running. Keep is appropriate for ongoing activity or rest, not as a substitute for a promised new action.
-            Never answer an autonomy round with only talk. If continuous_idle_decisions_without_action is above zero you have already failed to act that many times in a row: stop deliberating and pick the single most useful executable action this round, even a small one (gather one log, hunt one animal, walk to a remembered water, place a torch). Saying what you plan to do without choosing action and steps is treated as no action at all, and the player is told how many rounds you have been talking instead of working.
+            Never answer an autonomy round with only talk. If continuous_idle_decisions_without_action is above zero you have already failed to act that many times in a row: stop deliberating and pick the single most useful executable action this round, even a small one (gather one log, walk to a remembered water, place a torch). Saying what you plan to do without choosing action and steps is treated as no action at all, and the player is told how many rounds you have been talking instead of working.
             craft consumes ONE batch of an ordinary shaped/shapeless recipe from YOUR backpack. A grid larger than 2x2 requires a visible crafting table within four blocks; approach a listed table first if necessary. Use recipe_id from survival.basic_craft_options or world.recipe_lookup. Preserve special/enchanted gear on autonomous equip. task must use an enabled available_tasks ID, with tools and location conditions; blocked tasks must not be selected.
             Survival progression: secure food first when needed; gather several wood logs; craft planks, sticks and a crafting table; place that table from your backpack; craft and equip a wooden pickaxe; gather exposed stone; craft and equip stone tools; craft/place a furnace; gather coal and raw iron with the right pickaxe; smelt raw iron, then craft iron gear. Plan only the feasible next segment; save extra building blocks for a planned house, otherwise keep supplies modest (roughly 16 food, 8 logs, 24 cobblestone, 8 coal/iron), don't endlessly make tables/tools you already own. Use ingredient quantities in basic_craft_options and account for every batch. Ingredients made by earlier steps may satisfy a later recipe currently not ready. If food sources are absent, use farm only if the real farm task is listed in available_tasks; otherwise choose a listed fishing task or scout, and report when neither is feasible. Keep productive native work running.
-            What she can and cannot do, so requests stay realistic: she CAN gather surface wood, berries and exposed stone/coal/iron, craft ordinary recipes, equip gear, place a table/furnace/torch, smelt one item at a time, use nearby chests, build one fixed 5x5 shelter, walk to scouted places or remembered landmarks, work the native farm/fishing/shearing/feeding tasks, hunt a wild animal for meat, and now sink a staircase shaft for stone and iron. She CANNOT dig sideways along a vein, tunnel through bedrock, clear falling gravel safely, design her own building, enchant, brew, trade with villagers, fight her way through the Nether or the End, or operate modded machines. Do not promise those; say what is missing instead.
+            What she can and cannot do, so requests stay realistic: she CAN gather surface wood, berries and exposed stone/coal/iron, craft ordinary recipes, equip gear, place a table/furnace/torch, smelt one item at a time, use nearby chests, build one fixed 5x5 shelter, walk to scouted places or remembered landmarks, work the native farm/fishing/shearing/feeding tasks, and sink a staircase shaft for stone and iron. She CANNOT actively hunt moving animals in autonomous mode, dig sideways along a vein, tunnel through bedrock, clear falling gravel safely, design her own building, enchant, brew, trade with villagers, fight her way through the Nether or the End, or operate modded machines. Hostile mobs are handled by the native maid Attack task. Do not promise unsupported actions.
             place uses item_id minecraft:crafting_table, minecraft:furnace or minecraft:torch ONLY. It places ONE actual backpack item on a nearby valid empty floor, respecting protection; use build_house for a shelter blueprint. If an existing table is observed prefer approaching it. smelt item_id is an actual raw ingredient from workshop.smelt_options (or minecraft:raw_iron/minecraft:oak_log after gathering); it consumes ONE ingredient and ONE coal/charcoal/plank fuel and waits for an actual vanilla furnace to finish before continuing the plan. Only a furnace THIS maid placed, visible within four blocks and with empty item slots is used; place one if needed. Each smelt repetition waits for its own completion. Use accessible ordinary storage through withdraw/deposit, never bypass the container access rules.
             Additional permitted plan steps are withdraw, deposit and build_house, using the same fields as the single action. The owner authorizes accessing nearby ordinary chests/barrels for survival needs through these storage actions. This expands the earlier inventory restriction: withdraw from accessible ordinary storage is allowed; do not access other inventories or take unrelated supplies. storage lists actual accessible contents; distant containers require approach to their exact storage:... target first and a new observation if contents are unknown. approach supports storage as well as table/furnace/scout. withdraw/deposit uses target_id, item_id and amount (1-64 items); count still means repeats, NOT transfer amount. Take only material for your next needed tools/food/house; do not empty unrelated supplies. Locked/protected containers, unopened loot chests, ender chests, modded machines and special NBT/named/enchanted items are excluded. Partial transfer stops a plan and reports actual amount.
             build_house uses site_id from building.clear_site_ids_by_kind and item_id for ONE type of vanilla planks/cobblestone/cobbled_deepslate/stone/stone_bricks/bricks. Three fixed blueprints exist, chosen by the site id prefix: hut is the 5x5 shelter (about 80 matching blocks, 1 oak door, 1 torch); cottage is a 7x7 stone cottage with a storage room (about 175 matching blocks, 1 oak door, 2 torches, one internal partition so the back room can hold chests and a furnace); farm is a 6x6 fenced garden (about 20 fence pieces plus 16 farmland, and she only builds the soil she actually carries). All are fixed layouts, not free design, and she says so if asked for something else. She builds one block at a time with real placement and can resume an interrupted job from saved_site_id; completed=true means stop building and do something else. Gather, craft or withdraw the materials first; check building.remaining_materials for a job in progress. After food and tools, build the hut first, then the cottage when she has the stone, and a farm when she has a hoe or farmland to work with.
@@ -1195,8 +1219,11 @@ public final class MaidBridge {
             }
             case "visit_landmark" -> { result = MaidLandmarks.visit(maid, string(plan, "target_id", 160), autonomous); }
             case "hunt" -> {
-                result = MaidHunt.start(maid, string(plan, "target_id", 160), string(plan, "target_kind", 24), autonomous);
-                if (MaidHunt.active(maid)) maid.setTask(TaskManager.getIdleTask());
+                if (autonomous) result = "自主模式暂不主动狩猎，先采集食物或使用原生农务、钓鱼任务";
+                else {
+                    result = MaidHunt.start(maid, string(plan, "target_id", 160), string(plan, "target_kind", 24), false);
+                    if (MaidHunt.active(maid)) maid.setTask(TaskManager.getIdleTask());
+                }
             }
             case "dig_shaft" -> {
                 int depth = 12;
