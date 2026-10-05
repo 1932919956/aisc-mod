@@ -45,8 +45,8 @@ public final class MaidBridge {
      * busy: planning is skipped entirely whenever something is already in progress.
      */
     static final int AUTONOMOUS_INTERVAL = 900;
-    /** A request that has not answered in three minutes is treated as lost and cancelled. */
-    static final int REQUEST_WATCHDOG = 3600;
+    /** A request that has not answered in 90 seconds is treated as lost and cancelled. */
+    static final int REQUEST_WATCHDOG = 1800;
     static final int ACTIVITY_RANGE = 128;
     private static final String BINDING = "AgnesBoundMaid";
     private static final String DATA = "AgnesCompanionMind";
@@ -544,7 +544,8 @@ public final class MaidBridge {
                 && !MaidFieldwork.active(maid) && !MaidPlan.active(maid) && !MaidWorkshop.active(maid)
                 && !MaidBuilder.active(maid) && !MaidLandmarks.active(maid) && !MaidHunt.active(maid)
                 && !MaidDig.active(maid) && maid.getTarget() == null && !maid.isSleeping() && !maid.isOrderedToSit()
-                && maid.getTask() != TaskManager.getIdleTask()) {
+                && maid.getTask() != TaskManager.getIdleTask()
+                && maid.level().getGameTime() >= live.getLong("AgnesDecisionUntil")) {
                 maid.setTask(TaskManager.getIdleTask());
                 maid.getNavigation().stop();
                 maid.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
@@ -603,7 +604,8 @@ public final class MaidBridge {
         // Respect native sleeping, sitting and combat instead of interrupting them for a new plan.
         if (maid.isSleeping() || maid.isOrderedToSit() || maid.getTarget() != null || session.pending || !session.queue.isEmpty() || MaidFieldwork.active(maid) || MaidPlan.active(maid) || MaidWorkshop.active(maid) || MaidBuilder.active(maid) || MaidLandmarks.active(maid) || MaidHunt.active(maid) || MaidDig.active(maid) || now < data.getLong("ManualUntil")) return;
         // In free mode Agnes owns movement. Stop a native idle task from taking over between plans.
-        if (maid.getTask() != TaskManager.getIdleTask()) {
+        if (maid.getTask() != TaskManager.getIdleTask()
+            && now >= data.getLong("AgnesDecisionUntil")) {
             maid.setTask(TaskManager.getIdleTask());
             maid.getNavigation().stop();
             maid.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
@@ -625,21 +627,15 @@ public final class MaidBridge {
                 trace(maid, "planning autonomous round; food=" + MaidSurvival.foodCount(maid) + " idle=" + data.getInt("IdleNoAction")
                     + " task=" + maid.getTask().getUid());
                 request(maid, player, session, "继续按你自己的生存节奏玩下去。看当前观察、背包和上一步真实结果，决定这段游戏时间要做什么，优先让自己不饿、工具够用、有地方过夜；能顺手做的事就安排上，不要站在原地下指令。如果眼前的画面看不清想处理的东西，先用 look 或 scan_area 看一眼。", true);
+            } else {
+                outcome(maid, "没有配置 Agnes API Key，无法进行自主决策");
+                MaidBubble.think(maid, "还没有 API Key，暂时无法替你规划行动。");
+                data.putLong("NextThink", now + 200);
             }
             return;
         }
-        // Between planning cycles she keeps herself busy with light native work and says so, instead
-        // of standing still waiting for the next request. A real player always has a next small job.
-        try {
-            String lightWork = MaidSurvival.idleWork(maid, player);
-            if (!lightWork.isBlank()) {
-                data.putString("Goal", lightWork);
-                // Say what she actually decided to do, so the bubble matches the work in progress.
-                MaidBubble.speakIfExpired(maid, "idlework", lightWork, -1L);
-                MaidBubble.think(maid, "先做：" + lightWork);
-            }
-        } catch (RuntimeException unsupported) { data.putBoolean("IdleWork", false); }
-        // Walking back to a place she remembers, and checking it is still there when she arrives.
+        // Between decisions she stays still. Movement must come from a current Agnes plan or
+        // an explicitly selected native task; local idle roaming is disabled in free mode.
         try { MaidLandmarks.tick(maid, player); }
         catch (RuntimeException unsupported) { MaidLandmarks.cancel(maid); }
         // Deliberate hunting and a staircase shaft, both one-second state machines.
@@ -778,15 +774,21 @@ public final class MaidBridge {
         catch (RuntimeException preparationError) {
             session.pending = false;
             outcome(maid, "读取任务或环境时出错，未发送请求");
-            mind(maid).putLong("NextThink", maid.level().getGameTime() + PartnerConfig.planningInterval());
+            mind(maid).remove("LastAutonomousRequest");
+            mind(maid).putLong("NextThink", maid.level().getGameTime() + Math.min(PartnerConfig.planningInterval(), 200));
             if (!autonomous) tell(maid, player, "这次没能读取女仆的任务或环境，请稍后再试。");
         }
     }
 
     private static void requestInternal(EntityMaid maid, ServerPlayer player, Session session, String input, boolean autonomous) {
         if (!valid(maid, player)) return;
-        if (autonomous && mind(maid).contains("LastAutonomousRequest") && maid.level().getGameTime() < mind(maid).getLong("LastAutonomousRequest") + PartnerConfig.planningInterval()) {
-            mind(maid).putLong("NextThink", mind(maid).getLong("LastAutonomousRequest") + PartnerConfig.planningInterval()); return;
+        if (autonomous && mind(maid).contains("LastAutonomousRequest")) {
+            long now = maid.level().getGameTime();
+            long retryAt = mind(maid).getLong("RetryAt");
+            long regularDue = mind(maid).getLong("LastAutonomousRequest") + PartnerConfig.planningInterval();
+            if (now < regularDue && (retryAt <= 0 || now < retryAt)) {
+                mind(maid).putLong("NextThink", regularDue); return;
+            }
         }
         if (autonomous) mind(maid).putLong("LastAutonomousRequest", maid.level().getGameTime());
         if (!autonomous) {
@@ -982,7 +984,7 @@ public final class MaidBridge {
                 if (maid.level() != player.level() || maid.distanceToSqr(player) > ACTIVITY_RANGE * ACTIVITY_RANGE || !stamp(maid).equals(stateStamp)) {
                     result = "环境或手动任务已改变，本次计划未执行";
                     executed = false;
-                    mind(maid).putLong("NextThink", maid.level().getGameTime() + PartnerConfig.planningInterval());
+                    mind(maid).putLong("NextThink", maid.level().getGameTime() + Math.min(PartnerConfig.planningInterval(), 200));
                 } else { result = execute(maid, player, plan, autonomous); executed = true; }
                 if (!result.equals("保持当前活动")) outcome(maid, result);
                 if (autonomous && blockedProgress(result)) noteStuck(maid);
@@ -1016,7 +1018,8 @@ public final class MaidBridge {
                 if (detail == null || detail.isBlank()) detail = failure.getClass().getSimpleName();
                 detail = limit(detail.replaceAll("(?i)(Bearer\\s+)[^\\s]+", "$1***"), 180);
                 outcome(maid, "API 请求失败或回复格式异常：" + detail);
-                mind(maid).putLong("NextThink", maid.level().getGameTime() + PartnerConfig.planningInterval());
+                mind(maid).remove("LastAutonomousRequest");
+                mind(maid).putLong("NextThink", maid.level().getGameTime() + Math.min(PartnerConfig.planningInterval(), 200));
                 // Replace the pending thought with the honest reason instead of leaving a stale bubble.
                 MaidBubble.think(maid, autonomous ? "这一轮没想明白，过一会儿再试。" : "这次没接上话，再说一遍好吗？");
                 // Even with no answer from the service she still reacts in her own bubble rather than
@@ -1169,6 +1172,7 @@ public final class MaidBridge {
         if (!autonomous) mind(maid).putLong("ManualUntil", maid.level().getGameTime() + PartnerConfig.planningInterval());
         scheduleNext(maid);
         mind(maid).putInt("PlanRevision", mind(maid).getInt("PlanRevision") + 1);
+        mind(maid).putLong("AgnesDecisionUntil", maid.level().getGameTime() + PartnerConfig.planningInterval());
         String result;
         switch (action) {
             case "follow" -> { follow(maid); result = "已切换为跟随"; }
