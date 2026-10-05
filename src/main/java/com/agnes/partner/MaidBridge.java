@@ -631,6 +631,9 @@ public final class MaidBridge {
         // TLM's snowball task may target the owner and stop navigation after its throw animation.
         // Agnes work owns movement, so discard only that friendly target while a fieldwork step is active.
         PromaidCompat.protectAgnesWork(maid);
+        // Promaid's task tools are safe to run alongside Agnes and keep its own native work usable.
+        // This is a no-op when Promaid is absent or when the current task is not a Promaid task.
+        PromaidCompat.assistNativeTask(maid);
         nativeDefense(maid);
         if (maidReformBusy(maid)) {
             MaidPlan.clear(maid,"倒地或救援，暂停生存计划"); MaidWorkshop.cancel(maid,"倒地或救援");
@@ -724,6 +727,10 @@ public final class MaidBridge {
         if (maid.distanceToSqr(player) > ACTIVITY_RANGE * ACTIVITY_RANGE) return;
         // Respect native sleeping, sitting and combat instead of interrupting them for a new plan.
         if (maid.isSleeping() || maid.isOrderedToSit() || maid.getTarget() != null || session.pending || !session.queue.isEmpty() || MaidFieldwork.active(maid) || MaidPlan.active(maid) || MaidWorkshop.active(maid) || MaidBuilder.active(maid) || MaidLandmarks.active(maid) || MaidHunt.active(maid) || MaidDig.active(maid) || now < data.getLong("ManualUntil")) return;
+        // Any native task, including Promaid's maid_smart tasks, owns movement until it returns
+        // to idle. This prevents a fresh Agnes request from stealing its navigation halfway through
+        // mining, building, farming, brewing or another native job.
+        if (maid.getTask() != TaskManager.getIdleTask()) return;
         // Native TLM modes are allowed to run while autonomy remains enabled. Older code forced every
         // non-Agnes task back to idle here, so switching to farming/gathering immediately appeared to
         // fail. Remember the mode and resume autonomous planning only after it returns to idle.
@@ -783,6 +790,16 @@ public final class MaidBridge {
             if (!agnesTask.isBlank() && agnesTask.equals(maid.getTask().getUid().toString())) {
                 data.putString("NativeModeTask", agnesTask);
                 data.putLong("NativeModeSeen", maid.level().getGameTime());
+                return;
+            }
+            // Promaid's own work tasks are another autonomous controller, not a player mode
+            // switch. Keep Agnes autonomy enabled but let the current Promaid task own movement
+            // until it reports idle again. This preserves Promaid mining/building/farm work.
+            if (PromaidCompat.isPromaidTask(maid)) {
+                data.putString("NativeModeTask", maid.getTask().getUid().toString());
+                data.putLong("NativeModeSeen", maid.level().getGameTime());
+                data.remove("NativeModeSuspended");
+                data.remove("AutonomyBeforeNativeMode");
                 return;
             }
             if (!data.getBoolean("NativeModeSuspended")) {
@@ -1036,6 +1053,7 @@ public final class MaidBridge {
         }
         state.add("action_memory", actionMemory);
         state.addProperty("current_task", maid.getTask().getUid().toString());
+        state.add("promaid", PromaidCompat.describe(maid));
         state.addProperty("home_mode", maid.isHomeModeEnable());
         state.addProperty("health", maid.getHealth()); state.addProperty("max_health", maid.getMaxHealth());
         state.addProperty("schedule", maid.getSchedule().name());
@@ -1077,6 +1095,7 @@ public final class MaidBridge {
             want -- not a status report and not the same thing you already said (see recent_proactive_lines). When it is
             false, leave proactive_chat empty: the player just spoke or is busy.
             Treat yourself as a survival player: acquire your own food, materials and tools, make progress using real inventory, protect your life. Observe the image AND authoritative maid game state, decide what YOU will do, not instructions for the human. Autonomous planning runs at most once per the configured planning interval; between requests your selected steps really execute. Base each new decision on recent_actual_steps and actual inventory, not earlier promises. You do not need to fill time with speech or random wandering.
+            When promaid.installed is true, use its automatic native features as supporting systems: self-preservation and hostile defense, automatic tool/weapon equipment, held lighting, replanting, overflow/storage handling and cross-dimension following continue in the background. Do not duplicate those jobs with an Agnes plan. A current maid_smart task is Promaid-managed work, not a manual mode switch; let it finish and plan the next useful step afterward. Agnes remains the only planner for her own fieldwork, shaft and fixed shelter actions.
             action_memory is a persistent history of completed and blocked actions. Use it to avoid repeating work that already succeeded and to change approach after a recorded failure.
             Play it like a person with a routine, not a task runner. Keep one or two ongoing intentions (for example "finish the shelter", "get iron tools") and advance the next useful piece of them, instead of restarting from scratch or repeating a blocked action. Prefer a continuous activity over a single click: while food, wood or stone are short, batch several gather and craft operations in one plan. Include variety across a session: sometimes work near your base, sometimes walk out to a scout destination to see somewhere new, and use native farming, fishing, shearing, feeding or grass tasks only when they appear in available_tasks and their listed conditions match the real surroundings. Farming is available only when an actual harvestable crop or plantable soil with a seed in your inventory is within the maid task's work range; never select or repeat farm when farm is absent from available_tasks. Do not hoard: roughly 16 food, 8 logs, 24 stone and modest fuel is plenty, and extra effort belongs in tools, shelter or exploration. Follow the day: work in daylight, prepare light and a safe place before night, and respect your own sleep schedule. When you truly cannot do anything useful here, say the concrete missing condition instead of pretending, and consider moving somewhere more promising.
             fieldwork.area_survey incrementally scans a horizontal radius of 100 blocks in LOADED chunks, the nearby height band and surface. This is game-data knowledge, not visual line-of-sight or a guarantee of a path. Read scan_percent and skipped_unloaded_columns. An attached screenshot is YOUR MAID'S first-person camera at camera_observation.eye_position/yaw/pitch, NOT the owner's screen. It contains only terrain loaded by the owner's client. It is a past observation: use its age and capture pose; your current direction may have changed. Darkness, occlusion and missing terrain are not proof of an empty safe path. The authoritative game state and executable observed target IDs take priority over image guesses. If no image is attached do not pretend to see one. Do not say your observation range is four blocks; four blocks is the local workstation/container interaction distance, not your observation radius.
@@ -1442,7 +1461,10 @@ public final class MaidBridge {
         IMaidTask old = maid.getTask();
         try {
             maid.setTask(task);
-            FunctionCallSwitchResult result = task.onFunctionCallSwitch(maid);
+            // Promaid's combat compatibility layer performs the same native preflight plus
+            // modded-weapon detection. If it is absent, retain the TLM callback exactly as before.
+            FunctionCallSwitchResult result = PromaidCompat.prepareSwitch(maid, task);
+            if (result == null) result = task.onFunctionCallSwitch(maid);
             if (result == FunctionCallSwitchResult.MISSING_REQUIRED_ITEM) {
                 MaidSurvival.blockTask(maid, id, "缺少工具或材料");
                 maid.setTask(old); return "缺少任务工具或材料，已恢复原任务";
