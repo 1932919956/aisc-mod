@@ -1,5 +1,5 @@
 Agnes 女仆伙伴独立安装包
-版本：portable 1.0.46-portable + Promaid 1.3.0 Forge（旧 Agnes 版本已改名为 .disabled，不要与当前版一起激活）
+版本：portable 1.0.47-portable + Promaid 1.3.0 Forge（旧 Agnes 版本已改名为 .disabled，不要与当前版一起激活）
 
 这一版做了什么
   三、第三顺位备用改为通用 OpenAI 兼容接口
@@ -68,10 +68,10 @@ Agnes 女仆伙伴独立安装包
 
 节奏：planningIntervalSeconds 默认 30 秒（可改 10~300；旧配置若仍为 120，需要在 config 中改为 30）
 配置：allowWorldEditsWhenMobGriefingOff = true（你的整合包关了 mobGriefing）
-游戏：安装用-mods 里当前是 agnespartner-1.0.46-portable.jar 和 promaid-1.3.0-forge-1.20.1.jar，需要重启游戏生效；游戏 mods 目录中的旧版本已改名为 .disabled，避免重复加载
+游戏：安装用-mods 里当前是 agnespartner-1.0.47-portable.jar 和 promaid-1.3.0-forge-1.20.1.jar，需要重启游戏生效；游戏 mods 目录中的旧版本已改名为 .disabled，避免重复加载
 
 SHA256：
-安装用-mods\agnespartner-1.0.46-portable.jar | 355980 bytes | 61C99747EA394180A04552D98B7626263271313AEA742C69BE5767C80E65579C
+安装用-mods\agnespartner-1.0.47-portable.jar | 355967 bytes | EC252B7D98132E7CCBF3101CD1764F50B2B7337356A4CCC83AB2D2DDCF20818A
 安装用-mods\promaid-1.3.0-forge-1.20.1.jar | 12678111 bytes | 018DE4522FFE5BA7B1B27E91C59E34F47B67396CC4CC3E3B3DEBDF4F6673CCD0
 
 详细架构与功能总账：详细说明\架构与功能总览.md

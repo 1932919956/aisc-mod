@@ -15,7 +15,7 @@ final class MaidPlan {
      * that then never happens. hunt, dig_shaft and visit_landmark were missing exactly that way.
      */
     private static final Set<String> ACTIONS=Set.of("craft","equip","gather","approach","place","smelt",
-        "withdraw","deposit","build_house","hunt","dig_shaft","visit_landmark","look","scan_area");
+        "withdraw","deposit","build_house","dig_shaft","visit_landmark","look","scan_area");
     private static final Set<String> KINDS=Set.of("wood","berries","stone","coal","iron","animal","monster","any");
     private static final class Run {
         final Deque<JsonObject> steps;
