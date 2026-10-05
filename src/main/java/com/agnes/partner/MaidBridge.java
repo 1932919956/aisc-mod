@@ -52,6 +52,8 @@ public final class MaidBridge {
     static final int ACTIVITY_RANGE = 128;
     private static final String BINDING = "AgnesBoundMaid";
     private static final String DATA = "AgnesCompanionMind";
+    /** Arrival grace period: scan and refresh vision before Agnes is allowed to plan movement. */
+    private static final String ARRIVAL_UNTIL = "DimensionArrivalUntil";
     private static final Map<UUID, Session> SESSIONS = new HashMap<>();
     private static final Map<UUID, OwnerPosition> OWNER_POSITIONS = new HashMap<>();
     private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build();
@@ -124,6 +126,29 @@ public final class MaidBridge {
         mind(maid).putString("Outcome", "敌对生物靠近，女仆原生战斗中");
     }
 
+    private static void prepareAfterTeleport(ServerPlayer player, EntityMaid maid, String reason) {
+        if (maid == null || !maid.isAlive()) return;
+        MaidPlan.clear(maid, reason + "，清除旧计划");
+        MaidFieldwork.cancel(maid, reason + "，清除旧采集");
+        MaidWorkshop.cancel(maid, reason + "，清除旧烧炼");
+        MaidHunt.cancel(maid, reason + "，清除旧狩猎");
+        MaidDig.cancel(maid, reason + "，清除旧挖掘");
+        MaidLandmarks.cancel(maid);
+        maid.getNavigation().stop();
+        maid.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
+        if (!maid.isSleeping() && !maid.isOrderedToSit()) maid.setTask(TaskManager.getIdleTask());
+        CompoundTag data = mind(maid);
+        long now = maid.level().getGameTime();
+        data.putLong(ARRIVAL_UNTIL, now + 80);
+        data.putLong("NextThink", now + 100);
+        data.putLong("PlanRevision", data.getLong("PlanRevision") + 1);
+        data.putString("Outcome", "已抵达新位置，先重新识别周围环境");
+        MaidSurvey.remove(maid);
+        MaidVision.remove(player.getUUID());
+        MaidVision.track(player, maid);
+        MaidVision.request(player, maid);
+    }
+
     static boolean bringToOwner(ServerPlayer player, EntityMaid maid, String reason) {
         if (maid == null || !maid.isAlive()) return false;
         if (maidReformBusy(maid)) {
@@ -133,12 +158,8 @@ public final class MaidBridge {
         mind(maid).remove("FollowOwnerAfterReform");
         if (maid.level() == player.level()) {
             if (maid.distanceToSqr(player) > 12 * 12) {
-                MaidPlan.clear(maid,"跟随主人传送，重新观察环境"); MaidWorkshop.cancel(maid,"跟随主人传送");
                 maid.teleportTo(player.getX() + 1.5, player.getY(), player.getZ() + 1.5);
-                maid.getNavigation().stop();
-                maid.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
-                MaidFieldwork.cancel(maid, reason + "，已传送到主人身边");
-                MaidSurvey.remove(maid);
+                prepareAfterTeleport(player, maid, reason + "，已传送到主人身边");
                 return true;
             }
             return false;
@@ -149,6 +170,7 @@ public final class MaidBridge {
         EntityMaid moved = (EntityMaid)maid.getType().create(player.serverLevel());
         if (moved == null) return false;
         moved.load(saved);
+        moved.setOwnerUUID(player.getUUID());
         moved.moveTo(player.getX() + 1.5, player.getY(), player.getZ() + 1.5, maid.getYRot(), maid.getXRot());
         if (!player.serverLevel().addFreshEntity(moved)) return false;
 
@@ -156,12 +178,11 @@ public final class MaidBridge {
         // suppress its unloaded-maid record so the native recall system cannot create a duplicate later.
         MaidWorldData oldData = MaidWorldData.get(oldLevel);
         if (oldData != null) oldData.removeInfo(maid);
+        SESSIONS.remove(maid.getUUID());
+        playerData(player).putUUID(BINDING, moved.getUUID());
         maid.setOwnerUUID(null);
         maid.remove(net.minecraft.world.entity.Entity.RemovalReason.CHANGED_DIMENSION);
-        moved.getNavigation().stop();
-        moved.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
-        MaidFieldwork.cancel(moved, reason + "，已跟随主人切换维度");
-        MaidSurvey.remove(moved);
+        prepareAfterTeleport(player, moved, reason + "，已跟随主人切换维度");
         return true;
     }
 
@@ -555,6 +576,18 @@ public final class MaidBridge {
             }
         }
         catch (RuntimeException incompatibleBlock) { MaidSurvey.remove(maid); mind(maid).putString("Fieldwork", "扩大范围观察遇到不兼容方块，稍后重新扫描"); }
+        // A freshly arrived maid must not resume a stale path or native idle roaming. Let the
+        // incremental survey and the camera refresh finish first; native combat still has priority.
+        long arrivalUntil = mind(maid).getLong(ARRIVAL_UNTIL);
+        if (arrivalUntil > maid.level().getGameTime()) {
+            if (maid.getTarget() == null && !maid.isSleeping() && !maid.isOrderedToSit()) {
+                maid.setTask(TaskManager.getIdleTask());
+                maid.getNavigation().stop();
+                maid.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
+            }
+            if (maid.tickCount % 20 == 0) MaidVision.request(player, maid);
+            return;
+        }
         // Native movement guards and hunting need every server tick; planning remains throttled below.
         if (maid.tickCount % 20 != 0) {
             // Keep an active fieldwork path alive between the one-second state-machine updates.
