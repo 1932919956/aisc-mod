@@ -65,6 +65,8 @@ public final class MaidBridge {
         long lastSeen;
         /** Game time the current request started, so a request that never completes cannot wedge her. */
         long pendingSince;
+        /** Wall-clock start time, because the integrated server may stop advancing game ticks in ESC. */
+        long pendingWallMillis;
         /** Monotonic request generation; callbacks from an expired request must never touch the maid. */
         long requestGeneration;
         java.util.concurrent.CompletableFuture<?> pendingFuture;
@@ -560,6 +562,7 @@ public final class MaidBridge {
         session.requestGeneration++;
         session.pending = true;
         session.pendingSince = now;
+        session.pendingWallMillis = System.currentTimeMillis();
         session.pendingFuture = null;
         return session.requestGeneration;
     }
@@ -577,6 +580,7 @@ public final class MaidBridge {
         if (!currentPending(session, generation)) return;
         session.pending = false;
         session.pendingSince = 0;
+        session.pendingWallMillis = 0;
         session.pendingFuture = null;
     }
 
@@ -587,6 +591,7 @@ public final class MaidBridge {
         session.pendingFuture = null;
         session.pending = false;
         session.pendingSince = 0;
+        session.pendingWallMillis = 0;
         if (future != null) future.cancel(true);
     }
 
@@ -622,6 +627,7 @@ public final class MaidBridge {
         MaidDig.expire(maid);
         if (!valid(maid, player)) { MaidBuilder.cancel(maid,"绑定已失效"); MaidFieldwork.cancel(maid, "绑定已失效"); return; }
         if (player.level() != maid.level()) { MaidBuilder.cancel(maid,"主人已切换维度"); MaidFieldwork.cancel(maid, "主人已切换维度"); return; }
+        updateNativeModeAutonomy(maid, player);
         // TLM's snowball task may target the owner and stop navigation after its throw animation.
         // Agnes work owns movement, so discard only that friendly target while a fieldwork step is active.
         PromaidCompat.protectAgnesWork(maid);
@@ -660,17 +666,6 @@ public final class MaidBridge {
                 try { MaidFieldwork.tick(maid, player); }
                 catch (RuntimeException unsupported) { MaidFieldwork.cancel(maid, "此处采集与模组规则不兼容，停止本步并重新规划"); }
             }
-            CompoundTag live = mind(maid);
-            if (live.getBoolean("Autonomy") && !live.getBoolean("Recovering")
-                && !MaidFieldwork.active(maid) && !MaidPlan.active(maid) && !MaidWorkshop.active(maid)
-                && !MaidBuilder.active(maid) && !MaidLandmarks.active(maid) && !MaidHunt.active(maid)
-                && !MaidDig.active(maid) && maid.getTarget() == null && !maid.isSleeping() && !maid.isOrderedToSit()
-                && maid.getTask() != TaskManager.getIdleTask()
-                && maid.level().getGameTime() >= live.getLong("AgnesDecisionUntil")) {
-                maid.setTask(TaskManager.getIdleTask());
-                maid.getNavigation().stop();
-                maid.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
-            }
             return;
         }
         if (maid.tickCount % 1200 == 0) SESSIONS.entrySet().removeIf(e -> System.currentTimeMillis() - e.getValue().lastSeen > 180_000);
@@ -678,8 +673,11 @@ public final class MaidBridge {
         // because the planning gate skips everything while one is pending. This frees the gate and says
         // so, so a hung request can never look like "she simply refuses to act".
         Session watchdog = session(maid);
-        if (watchdog.pending && maid.level().getGameTime() - watchdog.pendingSince > REQUEST_WATCHDOG) {
-            long elapsed = Math.max(0, (maid.level().getGameTime() - watchdog.pendingSince) / 20);
+        long wallElapsed = watchdog.pendingWallMillis == 0 ? 0
+            : Math.max(0, System.currentTimeMillis() - watchdog.pendingWallMillis);
+        if (watchdog.pending && (maid.level().getGameTime() - watchdog.pendingSince > REQUEST_WATCHDOG
+            || wallElapsed > REQUEST_WATCHDOG * 50L)) {
+            long elapsed = Math.max(0, Math.max((maid.level().getGameTime() - watchdog.pendingSince) / 20, wallElapsed / 1000));
             invalidatePending(watchdog);
             watchdog.queue.clear();
             outcome(maid, "上一次请求超过 " + elapsed + " 秒没有返回，已取消它并继续安排");
@@ -726,13 +724,16 @@ public final class MaidBridge {
         if (maid.distanceToSqr(player) > ACTIVITY_RANGE * ACTIVITY_RANGE) return;
         // Respect native sleeping, sitting and combat instead of interrupting them for a new plan.
         if (maid.isSleeping() || maid.isOrderedToSit() || maid.getTarget() != null || session.pending || !session.queue.isEmpty() || MaidFieldwork.active(maid) || MaidPlan.active(maid) || MaidWorkshop.active(maid) || MaidBuilder.active(maid) || MaidLandmarks.active(maid) || MaidHunt.active(maid) || MaidDig.active(maid) || now < data.getLong("ManualUntil")) return;
-        // In free mode Agnes owns movement. Stop a native idle task from taking over between plans.
-        if (maid.getTask() != TaskManager.getIdleTask()
-            && now >= data.getLong("AgnesDecisionUntil")) {
-            maid.setTask(TaskManager.getIdleTask());
-            maid.getNavigation().stop();
-            maid.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
-            data.putString("Outcome", "自主模式已收回原生闲逛，等待 Agnes 下一步安排");
+        // Native TLM modes are allowed to run while autonomy remains enabled. Older code forced every
+        // non-Agnes task back to idle here, so switching to farming/gathering immediately appeared to
+        // fail. Remember the mode and resume autonomous planning only after it returns to idle.
+        if (maid.getTask() != TaskManager.getIdleTask()) {
+            data.putString("NativeModeTask", maid.getTask().getUid().toString());
+            data.putLong("NativeModeSeen", now);
+        } else if (data.contains("NativeModeTask")) {
+            data.remove("NativeModeTask");
+            data.putLong("NextThink", Math.min(data.getLong("NextThink"), now + 20));
+            data.putString("Outcome", "原生工作模式已结束，恢复 Agnes 自主规划");
         }
         long due = data.contains("RetryAt") && data.getLong("RetryAt") > 0
             ? data.getLong("RetryAt")
@@ -766,6 +767,51 @@ public final class MaidBridge {
         catch (RuntimeException unsupported) { MaidHunt.cancel(maid, "猎取与当前模组规则不兼容，停手了"); }
         try { MaidDig.tick(maid, player); }
         catch (RuntimeException unsupported) { MaidDig.cancel(maid, "挖掘与当前模组规则不兼容，停止挖掘"); }
+    }
+
+    /**
+     * Native TLM work modes are explicit player choices and must be allowed to run. While one is
+     * selected Agnes pauses her own planner; when TLM returns to its idle mode, autonomy resumes
+     * automatically. This prevents both controllers from changing the maid's mode every tick.
+     */
+    private static void updateNativeModeAutonomy(EntityMaid maid, ServerPlayer player) {
+        CompoundTag data = mind(maid);
+        if (maid.isSleeping() || maid.isOrderedToSit() || maid.getTarget() != null) return;
+        boolean nonIdle = maid.getTask() != TaskManager.getIdleTask();
+        if (nonIdle) {
+            String agnesTask = data.getString("AgnesSelectedNativeTask");
+            if (!agnesTask.isBlank() && agnesTask.equals(maid.getTask().getUid().toString())) {
+                data.putString("NativeModeTask", agnesTask);
+                data.putLong("NativeModeSeen", maid.level().getGameTime());
+                return;
+            }
+            if (!data.getBoolean("NativeModeSuspended")) {
+                data.putBoolean("NativeModeSuspended", true);
+                data.putBoolean("AutonomyBeforeNativeMode", data.getBoolean("Autonomy"));
+                if (data.getBoolean("Autonomy")) {
+                    data.putBoolean("Autonomy", false);
+                    MaidPlan.clear(maid, "切换到原生工作模式，暂停自主规划");
+                    MaidWorkshop.cancel(maid, "切换到原生工作模式");
+                    MaidFieldwork.cancel(maid, "切换到原生工作模式");
+                    trace(maid, "native task selected; autonomy paused task=" + maid.getTask().getUid());
+                }
+            }
+            data.putString("NativeModeTask", maid.getTask().getUid().toString());
+            data.putLong("NativeModeSeen", maid.level().getGameTime());
+            return;
+        }
+        if (data.getBoolean("NativeModeSuspended")) {
+            data.remove("NativeModeSuspended");
+            data.remove("NativeModeTask");
+            if (data.getBoolean("AutonomyBeforeNativeMode")) {
+                data.putBoolean("Autonomy", true);
+                data.putLong("NextThink", maid.level().getGameTime() + 20);
+                data.putString("Outcome", "原生工作模式已结束，恢复 Agnes 自主规划");
+                tell(maid, player, "原生工作结束了，我继续自己安排接下来的生存活动。 ");
+            }
+            data.remove("AutonomyBeforeNativeMode");
+        }
+        data.remove("AgnesSelectedNativeTask");
     }
 
     /**
@@ -1353,6 +1399,11 @@ public final class MaidBridge {
                         return "当前工作范围内没有可收获作物，也没有带种子的可播种耕地，未切换农田任务";
                 }
                 result = switchTask(maid, id);
+                if (autonomous && result.startsWith("已选择工作")) {
+                    // This native task was selected by Agnes herself; do not interpret it as a player
+                    // mode switch and suspend autonomy on the next tick.
+                    mind(maid).putString("AgnesSelectedNativeTask", maid.getTask().getUid().toString());
+                }
             }
             case "craft" -> { result = MaidSurvival.craft(maid, string(plan, "recipe_id", 160)); }
             case "equip" -> { result = MaidSurvival.equip(maid, string(plan, "item_id", 160), autonomous); }
