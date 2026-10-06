@@ -103,9 +103,14 @@ final class MaidBuilder {
     /** 5x5 hut: unchanged original layout, so existing saves and jobs keep working. */
     private static Blueprint hut(BlockPos origin,Item item) {
         List<Piece> pieces=new ArrayList<>();
-        for(int z=0;z<5;z++)for(int x=0;x<5;x++)pieces.add(new Piece(origin.offset(x,0,z),item));
+        // Build the floor perimeter first so wall blocks have solid support, while leaving the
+        // interior open for navigation. Filling the entire floor row-by-row first traps the maid
+        // behind her own blocks before she can reach the next row.
+        for(int z=0;z<5;z++)for(int x=0;x<5;x++)
+            if(x==0||x==4||z==0||z==4)pieces.add(new Piece(origin.offset(x,0,z),item));
         for(int y=1;y<=2;y++)for(int z=0;z<5;z++)for(int x=0;x<5;x++)
             if((x==0||x==4||z==0||z==4)&&!(x==2&&z==0))pieces.add(new Piece(origin.offset(x,y,z),item));
+        for(int z=1;z<4;z++)for(int x=1;x<4;x++)pieces.add(new Piece(origin.offset(x,0,z),item));
         for(int z=4;z>=0;z--)for(int x=0;x<5;x++)pieces.add(new Piece(origin.offset(x,3,z),item));
         pieces.add(new Piece(origin.offset(1,1,1),Items.TORCH));
         pieces.add(new Piece(origin.offset(2,1,0),Items.OAK_DOOR));
@@ -119,9 +124,9 @@ final class MaidBuilder {
      */
     private static Blueprint cottage(BlockPos origin,Item item) {
         List<Piece> pieces=new ArrayList<>();
-        // Floor and ceiling first, so the interior never has to be reached from above.
-        for(int z=0;z<7;z++)for(int x=0;x<7;x++)pieces.add(new Piece(origin.offset(x,0,z),item));
-        for(int z=6;z>=0;z--)for(int x=0;x<7;x++)pieces.add(new Piece(origin.offset(x,3,z),item));
+        // Perimeter floor first: it supports the outer wall while keeping the interior traversable.
+        for(int z=0;z<7;z++)for(int x=0;x<7;x++)
+            if(x==0||x==6||z==0||z==6)pieces.add(new Piece(origin.offset(x,0,z),item));
         // Outer walls, two blocks high, with the front doorway left open at x=3.
         for(int y=1;y<=2;y++)for(int z=0;z<7;z++)for(int x=0;x<7;x++) {
             boolean outer=(x==0||x==6||z==0||z==6);
@@ -135,6 +140,8 @@ final class MaidBuilder {
             if(x==0||x==6)continue;        // outer wall already placed
             pieces.add(new Piece(origin.offset(x,y,4),item));
         }
+        for(int z=1;z<=5;z++)for(int x=1;x<=5;x++)pieces.add(new Piece(origin.offset(x,0,z),item));
+        for(int z=6;z>=0;z--)for(int x=0;x<7;x++)pieces.add(new Piece(origin.offset(x,3,z),item));
         pieces.add(new Piece(origin.offset(1,1,1),Items.TORCH));
         pieces.add(new Piece(origin.offset(5,1,5),Items.TORCH));
         pieces.add(new Piece(origin.offset(3,1,0),Items.OAK_DOOR));
