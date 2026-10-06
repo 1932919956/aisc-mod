@@ -3,9 +3,11 @@ package com.agnes.verify;
 import com.google.gson.JsonObject;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraftforge.common.util.FakePlayerFactory;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
@@ -32,13 +34,15 @@ public final class VerifyMod {
     private net.minecraft.server.MinecraftServer server;
     private ServerLevel level;
     private Object maid;
-    /** 0 = finished, 1 = walking and mining, 2 = digging the staircase. */
+    /** 0 = finished, 1 = walking and mining, 2 = digging the staircase, 3 = building a hut. */
     private int phase;
     private int ticks;
     private int pulses;
     private BlockPos arena;
     private BlockPos gatherStone;
     private BlockPos digFloor;
+    private ServerPlayer buildOwner;
+    private BlockPos buildOrigin;
 
     public VerifyMod() { MinecraftForge.EVENT_BUS.register(this); }
 
@@ -68,7 +72,7 @@ public final class VerifyMod {
         check("agent-tools", () -> agentTools(level, maid));
         check("farm-availability", () -> farmingAvailability(level, maid));
         check("crafting", () -> crafting(maid));
-        gatherSetup();
+        buildSetup();
     }
 
     /**
@@ -89,6 +93,7 @@ public final class VerifyMod {
             pulses++;
             if (phase == 1) gatherStep();
             else if (phase == 2) digStep();
+            else if (phase == 3) buildStep();
         } catch (Throwable error) {
             failed++;
             System.out.println("VERIFY THREW phase" + phase + " :: " + error.getClass().getSimpleName()
@@ -121,6 +126,7 @@ public final class VerifyMod {
                 invokeStatic(machine, "cancel", new Class<?>[]{maidClass(), String.class}, maid, "harness begins");
             }
             net.minecraft.world.entity.Entity entity = (net.minecraft.world.entity.Entity) maid;
+            entity.setNoGravity(false);
             BlockPos base = arena;
             // She was spawned high in the air so the sight scan would have open space; put her on the
             // floor before the first tick or she would fall thirty blocks and die.
@@ -145,6 +151,119 @@ public final class VerifyMod {
         } catch (Throwable error) {
             failed++;
             System.out.println("VERIFY THREW executor-gather setup :: " + error);
+            finish();
+        }
+    }
+
+    /** Start a real 5x5 hut job with a bound owner and actual backpack materials. */
+    private void buildSetup() {
+        try {
+            for (String machine : new String[]{"MaidFieldwork", "MaidDig", "MaidBuilder"}) {
+                try { invokeStatic(machine, "cancel", new Class<?>[]{maidClass(), String.class}, maid, "harness begins"); }
+                catch (NoSuchMethodException ignored) { }
+            }
+            var entity = (com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid) maid;
+            // Reuse the same ground level that already passed the real walking/mining checks. A
+            // floating test platform at an arbitrary Y can make vanilla pathing report a reachable
+            // target while the maid cannot actually step through the surrounding block volume.
+            BlockPos buildBase = arena;
+            entity.moveTo(buildBase.getX() + 0.5, buildBase.getY(), buildBase.getZ() + 0.5, 0f, 0f);
+            entity.setNoGravity(false);
+            System.out.println("VERIFY build fixture: arena=" + arena + " base=" + buildBase
+                + " maid=" + entity.blockPosition());
+
+            // Expand the controlled floor so every candidate site returned by the real site scanner
+            // has solid footing and the maid can walk around the complete hut footprint.
+            for (BlockPos p : BlockPos.betweenClosed(buildBase.offset(-10, -2, -10), buildBase.offset(10, -1, 10)))
+                level.setBlockAndUpdate(p, Blocks.DIRT.defaultBlockState());
+            for (BlockPos p : BlockPos.betweenClosed(buildBase.offset(-10, 0, -10), buildBase.offset(10, 5, 10)))
+                level.setBlockAndUpdate(p, Blocks.AIR.defaultBlockState());
+
+            buildOwner = FakePlayerFactory.get(level,
+                new com.mojang.authlib.GameProfile(java.util.UUID.randomUUID(), "agnes-verify-owner"));
+            buildOwner.moveTo(entity.position());
+            entity.setOwnerUUID(buildOwner.getUUID());
+            invokeStatic("MaidBridge", "bind", new Class<?>[]{ServerPlayer.class, maidClass()}, buildOwner, maid);
+            clearBackpack(maid);
+            entity.setItemSlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND, net.minecraft.world.item.ItemStack.EMPTY);
+            give(maid, net.minecraft.world.item.Items.COBBLESTONE, 100);
+            give(maid, net.minecraft.world.item.Items.OAK_DOOR, 1);
+            give(maid, net.minecraft.world.item.Items.TORCH, 1);
+
+            JsonObject description = (JsonObject) invokeStatic("MaidBuilder", "describe",
+                new Class<?>[]{maidClass()}, maid);
+            var sites = description.getAsJsonObject("clear_site_ids_by_kind").getAsJsonArray("hut");
+            if (sites == null || sites.isEmpty()) throw new IllegalStateException("no clear hut site was observed");
+            String siteId = sites.get(0).getAsString();
+            String[] parts = siteId.split(":");
+            buildOrigin = new BlockPos(Integer.parseInt(parts[1]), Integer.parseInt(parts[2]), Integer.parseInt(parts[3]));
+            // The normal world can place a pond in a candidate footprint between the scan and the
+            // start call. Rebuild the selected test site immediately before starting, so a water
+            // refusal in this harness means the production safety rule saw a real hazard, not that
+            // the fixture leaked terrain from an earlier check.
+            for (BlockPos p : BlockPos.betweenClosed(buildOrigin.offset(-1, -1, -1), buildOrigin.offset(5, 4, 5)))
+                level.setBlockAndUpdate(p, Blocks.AIR.defaultBlockState());
+            for (BlockPos p : BlockPos.betweenClosed(buildOrigin.offset(-1, -1, -1), buildOrigin.offset(5, -1, 5)))
+                level.setBlockAndUpdate(p, Blocks.DIRT.defaultBlockState());
+            String start = (String) invokeStatic("MaidBuilder", "start",
+                new Class<?>[]{maidClass(), String.class, String.class, boolean.class},
+                maid, siteId, "minecraft:cobblestone", false);
+            System.out.println("VERIFY build start=[" + start + "] site=" + siteId);
+            if (start == null || !start.startsWith("正在")) {
+                failed++;
+                System.out.println("VERIFY FAIL executor-build :: refused to start: " + start);
+                finish();
+                return;
+            }
+            pulses = 0;
+            phase = 3;
+        } catch (Throwable error) {
+            failed++;
+            System.out.println("VERIFY THREW executor-build setup :: " + error);
+            finish();
+        }
+    }
+
+    /** Let the real builder run on server ticks, then verify every blueprint piece in the world. */
+    private void buildStep() throws Exception {
+        invokeStatic("MaidBuilder", "tick", new Class<?>[]{maidClass(), ServerPlayer.class}, maid, buildOwner);
+        boolean active = (Boolean) invokeStatic("MaidBuilder", "active", new Class<?>[]{maidClass()}, maid);
+        if (!active) {
+            var data = (net.minecraft.nbt.CompoundTag) invokeStatic("MaidBridge", "mind", new Class<?>[]{maidClass()}, maid);
+            if (!data.getBoolean("BuildSuccess")) {
+                failed++;
+                System.out.println("VERIFY FAIL executor-build :: builder stopped: " + data.getString("BuildResult"));
+                finish();
+                return;
+            }
+            Object blueprint = invokeStatic("MaidBuilder", "blueprint",
+                new Class<?>[]{String.class, BlockPos.class, net.minecraft.world.item.Item.class},
+                "hut", buildOrigin, net.minecraft.world.item.Items.COBBLESTONE);
+            int checked = 0;
+            for (Object piece : (java.util.List<?>) call(blueprint, "pieces")) {
+                BlockPos pos = (BlockPos) call(piece, "pos");
+                net.minecraft.world.item.Item item = (net.minecraft.world.item.Item) call(piece, "item");
+                if (item == net.minecraft.world.item.Items.OAK_DOOR) {
+                    if (!level.getBlockState(pos).is(Blocks.OAK_DOOR)
+                        || !level.getBlockState(pos.above()).is(Blocks.OAK_DOOR)) throw new IllegalStateException("door missing at " + pos);
+                } else if (item == net.minecraft.world.item.Items.TORCH) {
+                    if (!level.getBlockState(pos).is(Blocks.TORCH)) throw new IllegalStateException("torch missing at " + pos);
+                } else if (!(item instanceof net.minecraft.world.item.BlockItem block)
+                    || !level.getBlockState(pos).is(block.getBlock())) {
+                    throw new IllegalStateException("piece missing at " + pos + ": " + item);
+                }
+                checked++;
+            }
+            passed++;
+            System.out.println("VERIFY PASS executor-build :: real hut placed " + checked + " blueprint pieces in " + pulses + "s");
+            gatherSetup();
+            return;
+        }
+        if (pulses == 1 || pulses % 10 == 0)
+            System.out.println("VERIFY build t=" + pulses + "s " + where() + " result=[" + mind("BuildResult") + "]");
+        if (pulses >= 180) {
+            failed++;
+            System.out.println("VERIFY FAIL executor-build :: hut still active after 180s; result=[" + mind("BuildResult") + "]");
             finish();
         }
     }
@@ -578,6 +697,14 @@ public final class VerifyMod {
         for (int slot = 0; slot < inventory.getSlots() && !remainder.isEmpty(); slot++)
             remainder = inventory.insertItem(slot, remainder, false);
         if (!remainder.isEmpty()) throw new IllegalStateException("could not hand her " + item);
+    }
+
+    private void clearBackpack(Object maid) {
+        var inventory = ((com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid) maid).getAvailableBackpackInv();
+        for (int slot = 0; slot < inventory.getSlots(); slot++) {
+            var stack = inventory.getStackInSlot(slot);
+            if (!stack.isEmpty()) inventory.extractItem(slot, stack.getCount(), false);
+        }
     }
 
     private int countOf(Object maid, net.minecraft.world.item.Item item) {

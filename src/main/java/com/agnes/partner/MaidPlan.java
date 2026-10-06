@@ -8,6 +8,7 @@ import java.util.*;
 
 /** Runs bounded steps selected by Agnes, stopping on failed prerequisites or human intervention. */
 final class MaidPlan {
+    private static final int MAX_ACTIONS_PER_PLAN = 50;
     private static final Map<UUID,Run> RUNS=new HashMap<>();
     /**
      * Actions a single plan step may use. This must stay in step with the executor: a whitelist that
@@ -56,7 +57,8 @@ final class MaidPlan {
                     return "未执行：生存步骤缺少材料、配方或目标 ID";
                 if(Set.of("withdraw","deposit","build_house").contains(action)&&field(step,"item_id").isBlank())return "未执行：存取或建造步骤缺少物品 ID";
                 int count=step.has("count")?step.get("count").getAsInt():1;
-                if(count<1 || count>8 || steps.size()+count>16) return "未执行：单轮最多 16 次实际动作，每步最多重复 8 次";
+                if(count<1 || count>8 || steps.size()+count>MAX_ACTIONS_PER_PLAN)
+                    return "未执行：单轮最多 " + MAX_ACTIONS_PER_PLAN + " 次实际动作，每步最多重复 8 次";
                 for(int i=0;i<count;i++) steps.add(step.deepCopy());
             }
         } catch(RuntimeException invalid) { return "未执行：生存步骤格式错误"; }

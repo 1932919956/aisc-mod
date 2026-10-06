@@ -30,7 +30,10 @@ public final class PartnerSetupScreen extends Screen {
     public PartnerSetupScreen(Screen parent) { super(Component.literal("Agnes 伙伴 · API 设置")); this.parent=parent; }
 
     @SubscribeEvent public static void setup(FMLClientSetupEvent event) {
-        if (PartnerConfig.PORTABLE) ModLoadingContext.get().registerExtensionPoint(ConfigScreenHandler.ConfigScreenFactory.class,
+        // The Forge Mods screen is available in both portable and normal installations.
+        // Registering the screen only for portable builds leaves the normal game with a
+        // disabled "Config" button, preventing API and primary-model setup.
+        ModLoadingContext.get().registerExtensionPoint(ConfigScreenHandler.ConfigScreenFactory.class,
             () -> new ConfigScreenHandler.ConfigScreenFactory(PartnerSetupScreen::new));
     }
 
@@ -47,7 +50,7 @@ public final class PartnerSetupScreen extends Screen {
             vision=PartnerConfig.isVisionEnabled(); zhipuFallback=PartnerConfig.zhipuFallback.get(); customFallback=PartnerConfig.customFallback.get(); scroll=0;
         }
         key=secretBox(x,"Agnes API Key",previousKey); addRenderableWidget(key);
-        model=textBox(x,"主模型名称",previousModel,160); addRenderableWidget(model);
+        model=textBox(x,"Agnes 主模型名称（必填）",previousModel,160); addRenderableWidget(model);
         zhipuKey=secretBox(x,"智谱 API Key（可选）",previousZhipuKey); addRenderableWidget(zhipuKey);
         zhipuModel=textBox(x,"智谱模型名称",previousZhipuModel,160); addRenderableWidget(zhipuModel);
         zhipuToggle=Button.builder(fallbackLabel(),button->{zhipuFallback=!zhipuFallback;button.setMessage(fallbackLabel());}).bounds(x,0,w,20).build(); addRenderableWidget(zhipuToggle);
